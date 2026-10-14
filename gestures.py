@@ -1,23 +1,30 @@
 
+
+
 import cv2
 import mediapipe as mp
 import pyautogui
-import time
 import numpy as np
+import time
+import math
 
-# -------------------------
-# Configuration
-# -------------------------
-COOLDOWN = 0.8
-INDEX_HOLD_DURATION = 1.0
+# ==========================================
+# Gesture-Based Presentation Controller
+# Version 3 - No Drawing Mode
+# ==========================================
 
+CAMERA_INDEX = 0
+HOLD_TIME = 0.5
+COOLDOWN = 1.0
+
+enabled = False
 last_action_time = 0
-index_hold_start = None
-enable_control = False  # Start locked
+candidate = None
+candidate_start = time.time()
+action_done = False
+pinch_was_active = False
 
-# -------------------------
 # MediaPipe setup
-# -------------------------
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
@@ -25,259 +32,272 @@ hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,
     model_complexity=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+    min_detection_confidence=0.65,
+    min_tracking_confidence=0.65
 )
 
-# -------------------------
-# PyAutoGUI setup
-# -------------------------
+# Screen and camera setup
 screen_w, screen_h = pyautogui.size()
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.01
 
-# -------------------------
-# Webcam setup
-# -------------------------
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-time.sleep(2)
 
 if not cap.isOpened():
-    print("ERROR: Cannot open webcam.")
-    hands.close()
-    raise SystemExit
-
-success, test_frame = cap.read()
-
-if not success:
-    print("ERROR: Webcam opened but cannot provide frames.")
     cap.release()
-    hands.close()
-    raise SystemExit
-
-print("Webcam frame received successfully.")
+    cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
-    print("ERROR: Cannot access webcam.")
-    print("Check camera permissions or close other apps using the camera.")
     hands.close()
-    raise SystemExit
+    raise SystemExit("Cannot open webcam")
 
-print("Webcam started successfully.")
-print("Show an open palm to unlock gesture control.")
-print("Press ESC in the camera window to exit.")
+print("Gesture Controller started")
+print("Open palm: Unlock | Fist: Lock")
+print("Two fingers: Next | Four fingers: Previous")
+print("Index: Pointer | Thumbs up/down: Slideshow")
+print("Press ESC in the camera window to exit")
 
-# -------------------------
-# Helper function
-# -------------------------
-def fingers_up(hand):
-    tips = [4, 8, 12, 16, 20]
-    fingers = []
 
-    # Thumb: works best with the expected hand orientation
-    fingers.append(
-        hand.landmark[4].x < hand.landmark[3].x
+def finger_states(lm):
+    """Detect four fingers using their tip and middle-joint positions."""
+    tips = [8, 12, 16, 20]
+    joints = [6, 10, 14, 18]
+
+    return [
+        lm[tip].y < lm[joint].y
+        for tip, joint in zip(tips, joints)
+    ]
+
+
+def hand_gesture(lm):
+    """
+    Return a gesture label.
+    Finger extension depends on camera angle and hand orientation.
+    """
+    index, middle, ring, little = finger_states(lm)
+
+    thumb_tip = lm[4]
+    thumb_ip = lm[3]
+    thumb_mcp = lm[2]
+
+    # Normalized palm width
+    palm_width = max(
+        math.hypot(lm[5].x - lm[17].x,
+                   lm[5].y - lm[17].y),
+        0.001
     )
 
-    # Index, middle, ring and little fingers
-    for i in range(1, 5):
-        fingers.append(
-            hand.landmark[tips[i]].y
-            < hand.landmark[tips[i] - 2].y
-        )
+    thumb_index_distance = math.hypot(
+        lm[4].x - lm[8].x,
+        lm[4].y - lm[8].y
+    )
 
-    return fingers
+    # Pinch: thumb and index finger close together
+    if thumb_index_distance < palm_width * 0.25:
+        return "PINCH"
+
+    # Thumb spread for an open palm
+    thumb_spread = (
+        math.hypot(
+            lm[4].x - lm[5].x,
+            lm[4].y - lm[5].y
+        ) > palm_width * 0.8
+    )
+
+    # Open palm
+    if index and middle and ring and little and thumb_spread:
+        return "OPEN PALM"
+
+    # Four fingers, thumb folded
+    if index and middle and ring and little and not thumb_spread:
+        return "FOUR FINGERS"
+
+    # Two fingers
+    if index and middle and not ring and not little:
+        return "TWO FINGERS"
+
+    # Three fingers: not assigned an action
+    if index and middle and ring and not little:
+        return "THREE FINGERS"
+
+    # Index finger only
+    if index and not middle and not ring and not little:
+        return "INDEX"
+
+    # Thumb orientation for thumbs-up/down
+    other_fingers_folded = not any(
+        [index, middle, ring, little]
+    )
+
+    if other_fingers_folded:
+        if thumb_tip.y < thumb_ip.y < thumb_mcp.y:
+            return "THUMBS UP"
+
+        if thumb_tip.y > thumb_ip.y:
+            return "THUMBS DOWN"
+
+        return "FIST"
+
+    return "UNKNOWN"
 
 
-# -------------------------
-# Main loop
-# -------------------------
+def release_mouse():
+    try:
+        pyautogui.mouseUp()
+    except Exception:
+        pass
+
+
+def perform_action(gesture):
+    """Execute a confirmed gesture once."""
+    global enabled, last_action_time
+
+    now = time.time()
+
+    # Lock immediately; do not require an enabled state
+    if gesture == "FIST":
+        enabled = False
+        release_mouse()
+        print("Controls locked")
+        return
+
+    # Unlock
+    if gesture == "OPEN PALM":
+        enabled = True
+        print("Controls unlocked")
+        return
+
+    if not enabled:
+        return
+
+    if now - last_action_time < COOLDOWN:
+        return
+
+    if gesture == "TWO FINGERS":
+        pyautogui.press("right")
+        print("Next slide")
+
+    elif gesture == "FOUR FINGERS":
+        pyautogui.press("left")
+        print("Previous slide")
+
+    elif gesture == "THUMBS UP":
+        pyautogui.press("f5")
+        print("Start slideshow")
+
+    elif gesture == "THUMBS DOWN":
+        pyautogui.press("esc")
+        print("End slideshow")
+
+    elif gesture == "PINCH":
+        pyautogui.click()
+        print("Mouse click")
+
+    else:
+        return
+
+    last_action_time = now
+
+
 try:
     while True:
         success, frame = cap.read()
 
         if not success:
-            print("Cannot read webcam frame.")
+            print("Cannot read webcam frame")
             break
 
-        # Mirror the webcam image
         frame = cv2.flip(frame, 1)
-
-        # Convert BGR to RGB for MediaPipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
 
-        gesture_name = "No hand detected"
+        gesture = "NO HAND"
 
         if result.multi_hand_landmarks:
-            for hand in result.multi_hand_landmarks:
+            hand = result.multi_hand_landmarks[0]
+            lm = hand.landmark
 
-                mp_draw.draw_landmarks(
-                    frame,
-                    hand,
-                    mp_hands.HAND_CONNECTIONS
-                )
+            mp_draw.draw_landmarks(
+                frame, hand, mp_hands.HAND_CONNECTIONS
+            )
 
-                fingers = fingers_up(hand)
+            gesture = hand_gesture(lm)
 
-                # Gesture definitions
-                open_palm = fingers == [
-                    True, True, True, True, True
-                ]
-
-                fist = fingers == [
-                    False, False, False, False, False
-                ]
-
-                index_only = fingers == [
-                    False, True, False, False, False
-                ]
-
-                two_fingers = fingers == [
-                    False, True, True, False, False
-                ]
-
-                four_fingers = fingers == [
-                    False, True, True, True, True
-                ]
-
-                # Index finger position
-                index_tip = hand.landmark[8]
+            # Pointer movement
+            if enabled and gesture == "INDEX":
                 h, w, _ = frame.shape
 
-                x = int(index_tip.x * w)
-                y = int(index_tip.y * h)
+                x = int(lm[8].x * w)
+                y = int(lm[8].y * h)
 
-                cv2.circle(
-                    frame, (x, y), 8, (0, 0, 255), -1
-                )
+                sx = int(np.interp(
+                    x, [0, w], [50, screen_w - 50]
+                ))
+                sy = int(np.interp(
+                    y, [0, h], [50, screen_h - 50]
+                ))
 
-                # Lock / unlock
-                if open_palm:
-                    enable_control = True
+                pyautogui.moveTo(sx, sy, duration=0.01)
 
-                elif fist:
-                    enable_control = False
+            # Stable gesture confirmation
+            if gesture != candidate:
+                candidate = gesture
+                candidate_start = time.time()
+                action_done = False
 
-                if not enable_control:
-                    gesture_name = "LOCKED"
+            stable = time.time() - candidate_start >= HOLD_TIME
 
-                    # Release any held mouse/key state
-                    pyautogui.mouseUp()
-                    pyautogui.keyUp("ctrl")
-                    index_hold_start = None
+            if stable and not action_done:
+                if gesture in (
+                    "OPEN PALM", "FIST",
+                    "TWO FINGERS", "FOUR FINGERS",
+                    "THUMBS UP", "THUMBS DOWN"
+                ):
+                    perform_action(gesture)
+                    action_done = True
 
-                else:
-                    # Next slide: two fingers
-                    if two_fingers:
-                        gesture_name = "Next Slide"
+            # Pinch click only once per pinch
+            if enabled and gesture == "PINCH":
+                if not pinch_was_active:
+                    if time.time() - last_action_time >= COOLDOWN:
+                        pyautogui.click()
+                        last_action_time = time.time()
+                        print("Mouse click")
 
-                        if time.time() - last_action_time > COOLDOWN:
-                            pyautogui.press("right")
-                            last_action_time = time.time()
-
-                    # Previous slide: four fingers
-                    elif four_fingers:
-                        gesture_name = "Previous Slide"
-
-                        if time.time() - last_action_time > COOLDOWN:
-                            pyautogui.press("left")
-                            last_action_time = time.time()
-
-                    # Pointer and drawing mode
-                    elif index_only:
-                        gesture_name = "Pointer / Draw"
-
-                        screen_x = np.interp(
-                            x, [0, w], [50, screen_w - 50]
-                        )
-                        screen_y = np.interp(
-                            y, [0, h], [50, screen_h - 50]
-                        )
-
-                        pyautogui.moveTo(
-                            int(screen_x),
-                            int(screen_y),
-                            duration=0.01
-                        )
-
-                        if index_hold_start is None:
-                            index_hold_start = time.time()
-
-                        if (
-                            time.time() - index_hold_start
-                            >= INDEX_HOLD_DURATION
-                        ):
-                            gesture_name = "Drawing Mode"
-
-                        # Ctrl + mouse hold for drawing in
-                        # applications that support this action
-                        pyautogui.keyDown("ctrl")
-                        pyautogui.mouseDown()
-
-                    else:
-                        index_hold_start = None
-                        pyautogui.mouseUp()
-                        pyautogui.keyUp("ctrl")
-
-                        if open_palm:
-                            gesture_name = "Unlocked"
-                        elif fist:
-                            gesture_name = "Locked"
-                        else:
-                            gesture_name = "Ready"
-
-                # Show lock status and gesture
-                status = (
-                    "CONTROL ENABLED"
-                    if enable_control
-                    else "CONTROL LOCKED"
-                )
-
-                status_color = (
-                    (0, 255, 0)
-                    if enable_control
-                    else (0, 0, 255)
-                )
-
-                cv2.putText(
-                    frame, status, (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, status_color, 2
-                )
-
-                cv2.putText(
-                    frame, "Gesture: " + gesture_name, (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, (255, 255, 0), 2
-                )
+                pinch_was_active = True
+            else:
+                pinch_was_active = False
 
         else:
-            # If the hand disappears, release held inputs
-            pyautogui.mouseUp()
-            pyautogui.keyUp("ctrl")
-            index_hold_start = None
+            candidate = None
+            action_done = False
+            pinch_was_active = False
+            release_mouse()
 
-        # Always display the webcam frame
+        # Camera status display
+        status = "UNLOCKED" if enabled else "LOCKED"
+        color = (0, 255, 0) if enabled else (0, 0, 255)
+
+        cv2.putText(
+            frame, "Controls: " + status,
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            0.7, color, 2
+        )
+
+        cv2.putText(
+            frame, "Gesture: " + gesture,
+            (10, 65), cv2.FONT_HERSHEY_SIMPLEX,
+            0.65, (255, 255, 0), 2
+        )
+
         cv2.imshow("Gesture Controller", frame)
 
-        # Press ESC to exit
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
-except KeyboardInterrupt:
-    print("\nProgram stopped by user.")
-
 finally:
-    # Release all held inputs and close resources
-    try:
-        pyautogui.mouseUp()
-        pyautogui.keyUp("ctrl")
-    except Exception:
-        pass
-
+    release_mouse()
     cap.release()
     hands.close()
     cv2.destroyAllWindows()
-
-    print("Gesture controller closed safely.")
+    print("Controller closed safely")
